@@ -66,7 +66,7 @@ app.use(session({
  resave:false,saveUninitialized:false,
  cookie:{httpOnly:true,sameSite:"lax",secure:process.env.NODE_ENV==="production",maxAge:1000*60*60*8}
 }));
-app.use(express.static(path.join(__dirname,"public")));
+app.use(express.static(__dirname));
 const safeUser = u => ({id:u.id,name:u.name,email:u.email,role:u.role});
 const requireAuth=(req,res,next)=>req.session.user?next():res.status(401).json({error:"Please log in to continue."});
 const requireAdmin=(req,res,next)=>req.session.user?.role==="admin"?next():res.status(403).json({error:"Admin access required."});
@@ -184,5 +184,5 @@ app.post("/api/test/reset",requireAuth,requireAdmin,(req,res)=>{
  db.prepare("UPDATE products SET stock=18 WHERE name='Studio Wireless Headphones'").run();
  res.json({message:"Test data reset completed."});
 });
-app.get("*",(req,res)=>res.sendFile(path.join(__dirname,"public","index.html")));
+app.get("*",(req,res)=>res.sendFile(path.join(__dirname,"index.html")));
 app.listen(PORT,()=>console.log(`ShopX running on http://localhost:${PORT}`));
