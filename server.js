@@ -1,769 +1,610 @@
 const express = require("express");
-const session = require("express-session");
+const sqlite3 = require("sqlite3").verbose();
 const bcrypt = require("bcryptjs");
-const Database = require("better-sqlite3");
+const cookieParser = require("cookie-parser");
+const crypto = require("crypto");
 const path = require("path");
+const fs = require("fs");
 
 const app = express();
-
-// Render reverse proxy ke peeche app chalti hai.
-// Session cookies ke liye zaroori hai.
-app.set("trust proxy", 1);
-
 const PORT = process.env.PORT || 3000;
 
-const db = new Database(
-  process.env.DB_PATH ||
-    path.join(__dirname, "shopx.sqlite")
+app.use(express.json({ limit: "5mb" }));
+app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser());
+
+const publicFolder = path.join(__dirname, "public");
+const staticFolder = fs.existsSync(
+  path.join(publicFolder, "index.html")
+)
+  ? publicFolder
+  : __dirname;
+
+app.use(express.static(staticFolder));
+
+const db = new sqlite3.Database(
+  path.join(__dirname, "shopx.sqlite")
 );
 
-db.pragma("journal_mode = WAL");
-db.pragma("foreign_keys = ON");
+const sessions = new Map();
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    email TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL,
-    role TEXT NOT NULL DEFAULT 'customer',
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS products (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    category TEXT NOT NULL,
-    description TEXT DEFAULT '',
-    price REAL NOT NULL CHECK(price >= 0),
-    stock INTEGER NOT NULL DEFAULT 0 CHECK(stock >= 0),
-    image TEXT DEFAULT '',
-    active INTEGER NOT NULL DEFAULT 1
-  );
-
-  CREATE TABLE IF NOT EXISTS cart_items (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    product_id INTEGER NOT NULL,
-    quantity INTEGER NOT NULL CHECK(quantity > 0),
-    UNIQUE(user_id, product_id),
-    FOREIGN KEY(user_id) REFERENCES users(id),
-    FOREIGN KEY(product_id) REFERENCES products(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS wishlist (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    product_id INTEGER NOT NULL,
-    UNIQUE(user_id, product_id),
-    FOREIGN KEY(user_id) REFERENCES users(id),
-    FOREIGN KEY(product_id) REFERENCES products(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS orders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    total REAL NOT NULL,
-    status TEXT NOT NULL DEFAULT 'Pending',
-    address TEXT NOT NULL,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(user_id) REFERENCES users(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS order_items (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    order_id INTEGER NOT NULL,
-    product_id INTEGER NOT NULL,
-    product_name TEXT NOT NULL,
-    price REAL NOT NULL,
-    quantity INTEGER NOT NULL,
-    FOREIGN KEY(order_id) REFERENCES orders(id)
-  );
-`);
-
-/* -----------------------------
-   Default products
------------------------------ */
-
-const productCount = db
-  .prepare("SELECT COUNT(*) AS count FROM products")
-  .get().count;
-
-if (productCount === 0) {
-  const insertProduct = db.prepare(`
-    INSERT INTO products
-    (name, category, description, price, stock, image)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `);
-
-  const defaultProducts = [
-    [
-      "Studio Wireless Headphones",
-      "Audio",
-      "Comfortable wireless headphones with rich sound.",
-      3499,
-      18,
-      "🎧"
-    ],
-    [
-      "Everyday Digital Camera",
-      "Electronics",
-      "Compact camera for everyday photography.",
-      12999,
-      7,
-      "📷"
-    ],
-    [
-      "Minimalist Wristwatch",
-      "Accessories",
-      "A clean everyday watch with a durable strap.",
-      2299,
-      12,
-      "⌚"
-    ],
-    [
-      "Ceramic Morning Mug",
-      "Home",
-      "A ceramic mug for your morning coffee.",
-      649,
-      25,
-      "☕"
-    ],
-    [
-      "Classic Running Shoes",
-      "Fashion",
-      "Lightweight shoes for daily training.",
-      2799,
-      14,
-      "👟"
-    ],
-    [
-      "Portable Bluetooth Speaker",
-      "Audio",
-      "Portable speaker with clear audio.",
-      1899,
-      20,
-      "🔊"
-    ],
-    [
-      "Smart Desk Lamp",
-      "Home",
-      "Adjustable desk lamp with warm lighting.",
-      1499,
-      9,
-      "💡"
-    ],
-    [
-      "Mechanical Keyboard",
-      "Electronics",
-      "Tactile keyboard for work and gaming.",
-      4299,
-      11,
-      "⌨️"
-    ],
-    [
-      "Canvas Backpack",
-      "Fashion",
-      "Everyday backpack with roomy compartments.",
-      1599,
-      16,
-      "🎒"
-    ]
-  ];
-
-  defaultProducts.forEach(product => {
-    insertProduct.run(...product);
+function run(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function (error) {
+      if (error) {
+        reject(error);
+      } else {
+        resolve({
+          id: this.lastID,
+          changes: this.changes
+        });
+      }
+    });
   });
 }
 
-/* -----------------------------
-   Default users
------------------------------ */
-
-function seedUser(name, email, password, role) {
-  const cleanEmail = email.trim().toLowerCase();
-
-  const existingUser = db
-    .prepare("SELECT id FROM users WHERE email = ?")
-    .get(cleanEmail);
-
-  if (!existingUser) {
-    db.prepare(`
-      INSERT INTO users
-      (name, email, password_hash, role)
-      VALUES (?, ?, ?, ?)
-    `).run(
-      name,
-      cleanEmail,
-      bcrypt.hashSync(password, 10),
-      role
-    );
-  }
+function get(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (error, row) => {
+      if (error) {
+        reject(error);
+      } else {
+        resolve(row);
+      }
+    });
+  });
 }
 
-seedUser(
-  "ShopX Admin",
-  "admin@shopx.test",
-  "Admin123!",
-  "admin"
-);
+function all(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (error, rows) => {
+      if (error) {
+        reject(error);
+      } else {
+        resolve(rows);
+      }
+    });
+  });
+}
 
-seedUser(
-  "Demo Customer",
-  "customer@shopx.test",
-  "Customer123!",
-  "customer"
-);
+function exec(sql) {
+  return new Promise((resolve, reject) => {
+    db.exec(sql, error => {
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    });
+  });
+}
 
-/* -----------------------------
-   Middleware
------------------------------ */
+function createToken() {
+  return crypto.randomBytes(32).toString("hex");
+}
 
-app.use(express.json());
+function setSession(res, user) {
+  const token = createToken();
 
-app.use(
-  session({
-    secret:
-      process.env.SESSION_SECRET ||
-      "change-this-shopx-session-secret",
-
-    resave: false,
-    saveUninitialized: false,
-
-    cookie: {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: process.env.NODE_ENV === "production",
-      maxAge: 1000 * 60 * 60 * 8
-    }
-  })
-);
-
-app.use(express.static(__dirname));
-
-/* -----------------------------
-   Helpers
------------------------------ */
-
-function safeUser(user) {
-  if (!user) {
-    return null;
-  }
-
-  return {
+  sessions.set(token, {
     id: user.id,
     name: user.name,
     email: user.email,
     role: user.role
-  };
-}
+  });
 
-function createUserSession(
-  req,
-  res,
-  user,
-  statusCode = 200
-) {
-  req.session.regenerate(error => {
-    if (error) {
-      console.error(
-        "Session regenerate error:",
-        error
-      );
-
-      return res.status(500).json({
-        error:
-          "Account was created, but the session could not be started."
-      });
-    }
-
-    req.session.user = user;
-
-    req.session.save(saveError => {
-      if (saveError) {
-        console.error(
-          "Session save error:",
-          saveError
-        );
-
-        return res.status(500).json({
-          error:
-            "Account was created, but the login session could not be saved."
-        });
-      }
-
-      return res.status(statusCode).json({
-        user
-      });
-    });
+  res.cookie("shopx_session", token, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: process.env.NODE_ENV === "production",
+    maxAge: 1000 * 60 * 60 * 24 * 7
   });
 }
 
-function requireAuth(req, res, next) {
-  if (req.session && req.session.user) {
-    return next();
+function clearSession(req, res) {
+  const token = req.cookies.shopx_session;
+
+  if (token) {
+    sessions.delete(token);
   }
 
-  return res.status(401).json({
-    error: "Please log in to continue."
-  });
+  res.clearCookie("shopx_session");
+}
+
+function currentUser(req) {
+  const token = req.cookies.shopx_session;
+
+  if (!token) {
+    return null;
+  }
+
+  return sessions.get(token) || null;
+}
+
+function requireLogin(req, res, next) {
+  const user = currentUser(req);
+
+  if (!user) {
+    return res.status(401).json({
+      error: "Please login first."
+    });
+  }
+
+  req.user = user;
+  next();
 }
 
 function requireAdmin(req, res, next) {
-  if (
-    req.session &&
-    req.session.user &&
-    req.session.user.role === "admin"
-  ) {
-    return next();
+  const user = currentUser(req);
+
+  if (!user) {
+    return res.status(401).json({
+      error: "Please login first."
+    });
   }
 
-  return res.status(403).json({
-    error: "Admin access required."
-  });
+  if (user.role !== "admin") {
+    return res.status(403).json({
+      error: "Admin access required."
+    });
+  }
+
+  req.user = user;
+  next();
 }
 
-/* -----------------------------
-   Health and authentication
------------------------------ */
+function asyncRoute(handler) {
+  return function (req, res, next) {
+    Promise.resolve(handler(req, res, next)).catch(next);
+  };
+}
 
-app.get("/api/health", (req, res) => {
-  res.json({
-    status: "ok",
-    app: "ShopX",
-    database: "connected"
-  });
-});
+async function initializeDatabase() {
+  await exec(`
+    PRAGMA foreign_keys = ON;
 
-app.get("/api/auth/me", (req, res) => {
-  res.json({
-    user: req.session?.user || null
-  });
-});
-
-app.post("/api/auth/register", (req, res) => {
-  const {
-    name,
-    email,
-    password
-  } = req.body || {};
-
-  if (
-    !name ||
-    !name.trim() ||
-    !email ||
-    !email.trim() ||
-    !password
-  ) {
-    return res.status(400).json({
-      error:
-        "Name, email and password are required."
-    });
-  }
-
-  const cleanName = name.trim();
-  const cleanEmail = email.trim().toLowerCase();
-
-  if (
-    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)
-  ) {
-    return res.status(400).json({
-      error: "Enter a valid email address."
-    });
-  }
-
-  if (password.length < 8) {
-    return res.status(400).json({
-      error:
-        "Password must be at least 8 characters."
-    });
-  }
-
-  try {
-    const result = db
-      .prepare(`
-        INSERT INTO users
-        (name, email, password_hash, role)
-        VALUES (?, ?, ?, 'customer')
-      `)
-      .run(
-        cleanName,
-        cleanEmail,
-        bcrypt.hashSync(password, 10)
-      );
-
-    const userRow = db
-      .prepare(
-        "SELECT * FROM users WHERE id = ?"
-      )
-      .get(result.lastInsertRowid);
-
-    const user = safeUser(userRow);
-
-    return createUserSession(
-      req,
-      res,
-      user,
-      201
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      email TEXT NOT NULL UNIQUE,
+      password TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'customer',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
-  } catch (error) {
-    console.error("Register error:", error);
 
-    if (
-      String(error.message).includes("UNIQUE")
-    ) {
-      return res.status(409).json({
-        error:
-          "An account with this email already exists."
-      });
-    }
-
-    return res.status(500).json({
-      error: "Could not create the account."
-    });
-  }
-});
-
-app.post("/api/auth/login", (req, res) => {
-  const {
-    email,
-    password
-  } = req.body || {};
-
-  if (!email || !password) {
-    return res.status(400).json({
-      error: "Email and password are required."
-    });
-  }
-
-  const cleanEmail = email.trim().toLowerCase();
-
-  const userRow = db
-    .prepare(
-      "SELECT * FROM users WHERE email = ?"
-    )
-    .get(cleanEmail);
-
-  if (
-    !userRow ||
-    !bcrypt.compareSync(
-      password,
-      userRow.password_hash
-    )
-  ) {
-    return res.status(401).json({
-      error: "Invalid email or password."
-    });
-  }
-
-  const user = safeUser(userRow);
-
-  return createUserSession(
-    req,
-    res,
-    user,
-    200
-  );
-});
-
-app.post("/api/auth/logout", (req, res) => {
-  req.session.destroy(error => {
-    if (error) {
-      console.error("Logout error:", error);
-
-      return res.status(500).json({
-        error: "Could not log out."
-      });
-    }
-
-    res.clearCookie("connect.sid", {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: process.env.NODE_ENV === "production"
-    });
-
-    return res.json({
-      message: "Logged out successfully."
-    });
-  });
-});
-
-/* -----------------------------
-   Products
------------------------------ */
-
-app.get("/api/products", (req, res) => {
-  const {
-    search = "",
-    category = "",
-    sort = "popular",
-    min = "",
-    max = ""
-  } = req.query;
-
-  let sql = `
-    SELECT *
-    FROM products
-    WHERE active = 1
-  `;
-
-  const args = [];
-
-  if (search) {
-    sql += `
-      AND (
-        name LIKE ?
-        OR description LIKE ?
-      )
-    `;
-
-    args.push(
-      `%${search}%`,
-      `%${search}%`
+    CREATE TABLE IF NOT EXISTS products (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE,
+      category TEXT NOT NULL,
+      brand TEXT DEFAULT '',
+      description TEXT DEFAULT '',
+      price REAL NOT NULL DEFAULT 0,
+      stock INTEGER NOT NULL DEFAULT 0,
+      image TEXT DEFAULT '📦',
+      rating REAL NOT NULL DEFAULT 4.2,
+      popularity INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
-  }
 
-  if (category) {
-    sql += " AND category = ?";
-    args.push(category);
-  }
+    CREATE TABLE IF NOT EXISTS cart_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      product_id INTEGER NOT NULL,
+      quantity INTEGER NOT NULL DEFAULT 1,
+      UNIQUE(user_id, product_id),
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
+    );
 
-  if (min !== "") {
-    sql += " AND price >= ?";
-    args.push(Number(min));
-  }
+    CREATE TABLE IF NOT EXISTS wishlist (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      product_id INTEGER NOT NULL,
+      UNIQUE(user_id, product_id),
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
+    );
 
-  if (max !== "") {
-    sql += " AND price <= ?";
-    args.push(Number(max));
-  }
+    CREATE TABLE IF NOT EXISTS orders (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      address TEXT NOT NULL,
+      total REAL NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'Placed',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
 
-  if (sort === "price-low") {
-    sql += " ORDER BY price ASC";
-  } else if (sort === "price-high") {
-    sql += " ORDER BY price DESC";
-  } else {
-    sql += " ORDER BY id DESC";
-  }
+    CREATE TABLE IF NOT EXISTS order_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      order_id INTEGER NOT NULL,
+      product_id INTEGER NOT NULL,
+      product_name TEXT NOT NULL,
+      price REAL NOT NULL,
+      quantity INTEGER NOT NULL,
+      FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE
+    );
 
-  return res.json(
-    db.prepare(sql).all(...args)
+    CREATE TABLE IF NOT EXISTS coupons (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      code TEXT NOT NULL UNIQUE,
+      description TEXT DEFAULT '',
+      discount_type TEXT NOT NULL DEFAULT 'percentage',
+      discount_value REAL NOT NULL DEFAULT 0,
+      active INTEGER NOT NULL DEFAULT 1,
+      expires_at TEXT DEFAULT ''
+    );
+
+    CREATE TABLE IF NOT EXISTS reviews (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      product_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      rating INTEGER NOT NULL,
+      comment TEXT DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+  `);
+
+  const adminPassword = await bcrypt.hash(
+    "Admin123!",
+    10
   );
-});
 
-app.get("/api/products/:id", (req, res) => {
-  const product = db
-    .prepare(`
-      SELECT *
-      FROM products
-      WHERE id = ?
-      AND active = 1
-    `)
-    .get(req.params.id);
+  await run(
+    `
+      INSERT OR IGNORE INTO users
+      (name, email, password, role)
+      VALUES (?, ?, ?, 'admin')
+    `,
+    [
+      "ShopX Admin",
+      "admin@shopx.test",
+      adminPassword
+    ]
+  );
 
-  if (!product) {
-    return res.status(404).json({
-      error: "Product not found."
-    });
-  }
+  const customerPassword = await bcrypt.hash(
+    "Customer123!",
+    10
+  );
 
-  return res.json(product);
-});
+  await run(
+    `
+      INSERT OR IGNORE INTO users
+      (name, email, password, role)
+      VALUES (?, ?, ?, 'customer')
+    `,
+    [
+      "Demo Customer",
+      "customer@shopx.test",
+      customerPassword
+    ]
+  );
 
-/* -----------------------------
-   Admin products
------------------------------ */
+  const productCount = await get(
+    "SELECT COUNT(*) AS count FROM products"
+  );
 
-app.post(
-  "/api/admin/products",
-  requireAuth,
-  requireAdmin,
-  (req, res) => {
-    const {
-      name,
-      category,
-      description = "",
-      price,
-      stock,
-      image = "📦"
-    } = req.body || {};
+  if (productCount.count === 0) {
+    const demoProducts = [
+      [
+        "Wireless Headphones",
+        "Audio",
+        "SoundMax",
+        "Comfortable wireless headphones with clear sound.",
+        1499,
+        25,
+        "🎧",
+        4.5,
+        90
+      ],
+      [
+        "Smartphone Stand",
+        "Accessories",
+        "DeskPro",
+        "Adjustable stand for phones and tablets.",
+        399,
+        40,
+        "📱",
+        4.2,
+        70
+      ],
+      [
+        "Everyday Backpack",
+        "Fashion",
+        "UrbanCarry",
+        "Lightweight backpack for work, college and travel.",
+        899,
+        18,
+        "🎒",
+        4.4,
+        85
+      ],
+      [
+        "LED Desk Lamp",
+        "Home",
+        "BrightHome",
+        "Modern desk lamp with adjustable brightness.",
+        699,
+        12,
+        "💡",
+        4.3,
+        62
+      ],
+      [
+        "Bluetooth Speaker",
+        "Audio",
+        "SoundMax",
+        "Portable speaker with powerful wireless sound.",
+        1199,
+        8,
+        "🔊",
+        4.1,
+        78
+      ],
+      [
+        "Running Shoes",
+        "Fashion",
+        "MoveFit",
+        "Comfortable lightweight shoes for everyday use.",
+        1799,
+        15,
+        "👟",
+        4.6,
+        92
+      ]
+    ];
 
-    if (
-      !name ||
-      !name.trim() ||
-      !category ||
-      !category.trim() ||
-      !Number.isFinite(Number(price)) ||
-      Number(price) < 0 ||
-      !Number.isInteger(Number(stock)) ||
-      Number(stock) < 0
-    ) {
-      return res.status(400).json({
-        error:
-          "Enter a product name, category, valid price and non-negative whole-number stock."
-      });
-    }
-
-    const result = db
-      .prepare(`
-        INSERT INTO products
-        (name, category, description, price, stock, image)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `)
-      .run(
-        name.trim(),
-        category.trim(),
-        description,
-        Number(price),
-        Number(stock),
-        image
+    for (const product of demoProducts) {
+      await run(
+        `
+          INSERT INTO products
+          (
+            name,
+            category,
+            brand,
+            description,
+            price,
+            stock,
+            image,
+            rating,
+            popularity
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+        product
       );
-
-    const product = db
-      .prepare(
-        "SELECT * FROM products WHERE id = ?"
-      )
-      .get(result.lastInsertRowid);
-
-    return res.status(201).json(product);
-  }
-);
-
-app.put(
-  "/api/admin/products/:id",
-  requireAuth,
-  requireAdmin,
-  (req, res) => {
-    const {
-      name,
-      category,
-      description = "",
-      price,
-      stock,
-      image = "📦"
-    } = req.body || {};
-
-    if (
-      !name ||
-      !name.trim() ||
-      !category ||
-      !category.trim() ||
-      !Number.isFinite(Number(price)) ||
-      Number(price) < 0 ||
-      !Number.isInteger(Number(stock)) ||
-      Number(stock) < 0
-    ) {
-      return res.status(400).json({
-        error:
-          "Please enter valid product details."
-      });
     }
-
-    const result = db
-      .prepare(`
-        UPDATE products
-        SET
-          name = ?,
-          category = ?,
-          description = ?,
-          price = ?,
-          stock = ?,
-          image = ?
-        WHERE id = ?
-      `)
-      .run(
-        name.trim(),
-        category.trim(),
-        description,
-        Number(price),
-        Number(stock),
-        image,
-        req.params.id
-      );
-
-    if (!result.changes) {
-      return res.status(404).json({
-        error: "Product not found."
-      });
-    }
-
-    const product = db
-      .prepare(
-        "SELECT * FROM products WHERE id = ?"
-      )
-      .get(req.params.id);
-
-    return res.json(product);
   }
-);
+}
 
-app.delete(
-  "/api/admin/products/:id",
-  requireAuth,
-  requireAdmin,
-  (req, res) => {
-    const result = db
-      .prepare(`
-        UPDATE products
-        SET active = 0
-        WHERE id = ?
-      `)
-      .run(req.params.id);
-
-    if (!result.changes) {
-      return res.status(404).json({
-        error: "Product not found."
-      });
-    }
-
-    return res.json({
-      message: "Product deleted successfully."
-    });
-  }
-);
-
-/* -----------------------------
-   Cart
------------------------------ */
+/* ---------------- AUTH ---------------- */
 
 app.get(
-  "/api/cart",
-  requireAuth,
-  (req, res) => {
-    const items = db
-      .prepare(`
-        SELECT
-          c.quantity,
-          p.*
-        FROM cart_items c
-        JOIN products p
-          ON p.id = c.product_id
-        WHERE c.user_id = ?
-        AND p.active = 1
-      `)
-      .all(req.session.user.id);
-
-    return res.json(items);
-  }
+  "/api/auth/me",
+  asyncRoute(async (req, res) => {
+    res.json({
+      user: currentUser(req)
+    });
+  })
 );
 
 app.post(
-  "/api/cart",
-  requireAuth,
-  (req, res) => {
-    const {
-      productId,
-      quantity = 1
-    } = req.body || {};
+  "/api/auth/register",
+  asyncRoute(async (req, res) => {
+    const name = String(req.body.name || "").trim();
+    const email = String(req.body.email || "")
+      .trim()
+      .toLowerCase();
+    const password = String(
+      req.body.password || ""
+    );
 
-    const product = db
-      .prepare(`
+    if (!name || !email || !password) {
+      return res.status(400).json({
+        error: "Name, email and password are required."
+      });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({
+        error: "Password must be at least 6 characters."
+      });
+    }
+
+    const existing = await get(
+      "SELECT id FROM users WHERE email = ?",
+      [email]
+    );
+
+    if (existing) {
+      return res.status(409).json({
+        error: "An account with this email already exists."
+      });
+    }
+
+    const passwordHash = await bcrypt.hash(
+      password,
+      10
+    );
+
+    const result = await run(
+      `
+        INSERT INTO users
+        (name, email, password, role)
+        VALUES (?, ?, ?, 'customer')
+      `,
+      [name, email, passwordHash]
+    );
+
+    const user = {
+      id: result.id,
+      name,
+      email,
+      role: "customer"
+    };
+
+    setSession(res, user);
+
+    res.status(201).json({
+      user
+    });
+  })
+);
+
+app.post(
+  "/api/auth/login",
+  asyncRoute(async (req, res) => {
+    const email = String(req.body.email || "")
+      .trim()
+      .toLowerCase();
+    const password = String(
+      req.body.password || ""
+    );
+
+    const user = await get(
+      `
+        SELECT id, name, email, password, role
+        FROM users
+        WHERE email = ?
+      `,
+      [email]
+    );
+
+    if (!user) {
+      return res.status(401).json({
+        error: "Invalid email or password."
+      });
+    }
+
+    const valid = await bcrypt.compare(
+      password,
+      user.password
+    );
+
+    if (!valid) {
+      return res.status(401).json({
+        error: "Invalid email or password."
+      });
+    }
+
+    const safeUser = {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      role: user.role
+    };
+
+    setSession(res, safeUser);
+
+    res.json({
+      user: safeUser
+    });
+  })
+);
+
+app.post(
+  "/api/auth/logout",
+  asyncRoute(async (req, res) => {
+    clearSession(req, res);
+
+    res.json({
+      success: true
+    });
+  })
+);
+
+/* ---------------- PRODUCTS ---------------- */
+
+app.get(
+  "/api/products",
+  asyncRoute(async (req, res) => {
+    const search = String(
+      req.query.search || ""
+    ).trim();
+
+    const category = String(
+      req.query.category || ""
+    ).trim();
+
+    const sort = String(
+      req.query.sort || "popular"
+    );
+
+    let sql = `
+      SELECT
+        id,
+        name,
+        category,
+        brand,
+        description,
+        price,
+        stock,
+        image,
+        rating,
+        popularity,
+        created_at
+      FROM products
+      WHERE 1 = 1
+    `;
+
+    const params = [];
+
+    if (search) {
+      sql += `
+        AND (
+          name LIKE ?
+          OR description LIKE ?
+          OR category LIKE ?
+          OR brand LIKE ?
+        )
+      `;
+
+      const keyword = `%${search}%`;
+
+      params.push(
+        keyword,
+        keyword,
+        keyword,
+        keyword
+      );
+    }
+
+    if (category) {
+      sql += " AND category = ?";
+      params.push(category);
+    }
+
+    if (sort === "price-low") {
+      sql += " ORDER BY price ASC";
+    } else if (sort === "price-high") {
+      sql += " ORDER BY price DESC";
+    } else {
+      sql += `
+        ORDER BY popularity DESC, rating DESC, id DESC
+      `;
+    }
+
+    const products = await all(sql, params);
+
+    res.json(products);
+  })
+);
+
+app.get(
+  "/api/products/:id",
+  asyncRoute(async (req, res) => {
+    const product = await get(
+      `
         SELECT *
         FROM products
         WHERE id = ?
-        AND active = 1
-      `)
-      .get(productId);
+      `,
+      [req.params.id]
+    );
 
     if (!product) {
       return res.status(404).json({
@@ -771,160 +612,243 @@ app.post(
       });
     }
 
-    if (
-      !Number.isInteger(Number(quantity)) ||
-      Number(quantity) < 1
-    ) {
-      return res.status(400).json({
-        error: "Quantity must be at least 1."
-      });
-    }
+    res.json(product);
+  })
+);
 
-    const existing = db
-      .prepare(`
-        SELECT quantity
-        FROM cart_items
-        WHERE user_id = ?
-        AND product_id = ?
-      `)
-      .get(
-        req.session.user.id,
-        productId
-      );
+/* ---------------- CART ---------------- */
 
-    const nextQuantity =
-      Number(existing?.quantity || 0) +
-      Number(quantity);
-
-    if (nextQuantity > product.stock) {
-      return res.status(400).json({
-        error:
-          "Requested quantity exceeds available stock."
-      });
-    }
-
-    db.prepare(`
-      INSERT INTO cart_items
-      (user_id, product_id, quantity)
-      VALUES (?, ?, ?)
-      ON CONFLICT(user_id, product_id)
-      DO UPDATE SET quantity = excluded.quantity
-    `).run(
-      req.session.user.id,
-      productId,
-      nextQuantity
+app.get(
+  "/api/cart",
+  requireLogin,
+  asyncRoute(async (req, res) => {
+    const items = await all(
+      `
+        SELECT
+          p.id,
+          p.name,
+          p.category,
+          p.brand,
+          p.description,
+          p.price,
+          p.stock,
+          p.image,
+          c.quantity
+        FROM cart_items c
+        JOIN products p
+          ON p.id = c.product_id
+        WHERE c.user_id = ?
+        ORDER BY c.id DESC
+      `,
+      [req.user.id]
     );
 
-    return res.json({
-      message: "Product added to cart."
+    res.json(items);
+  })
+);
+
+app.post(
+  "/api/cart",
+  requireLogin,
+  asyncRoute(async (req, res) => {
+    const productId = Number(
+      req.body.productId
+    );
+
+    const product = await get(
+      "SELECT * FROM products WHERE id = ?",
+      [productId]
+    );
+
+    if (!product) {
+      return res.status(404).json({
+        error: "Product not found."
+      });
+    }
+
+    if (product.stock < 1) {
+      return res.status(400).json({
+        error: "This product is out of stock."
+      });
+    }
+
+    const existing = await get(
+      `
+        SELECT *
+        FROM cart_items
+        WHERE user_id = ? AND product_id = ?
+      `,
+      [req.user.id, productId]
+    );
+
+    if (existing) {
+      const newQuantity =
+        existing.quantity + 1;
+
+      if (newQuantity > product.stock) {
+        return res.status(400).json({
+          error: "Not enough stock available."
+        });
+      }
+
+      await run(
+        `
+          UPDATE cart_items
+          SET quantity = ?
+          WHERE id = ?
+        `,
+        [newQuantity, existing.id]
+      );
+    } else {
+      await run(
+        `
+          INSERT INTO cart_items
+          (user_id, product_id, quantity)
+          VALUES (?, ?, 1)
+        `,
+        [req.user.id, productId]
+      );
+    }
+
+    await run(
+      `
+        UPDATE products
+        SET popularity = popularity + 1
+        WHERE id = ?
+      `,
+      [productId]
+    );
+
+    res.status(201).json({
+      success: true
     });
-  }
+  })
 );
 
 app.put(
-  "/api/cart/:productId",
-  requireAuth,
-  (req, res) => {
-    const quantity = Number(
-      req.body?.quantity
+  "/api/cart/:id",
+  requireLogin,
+  asyncRoute(async (req, res) => {
+    const productId = Number(
+      req.params.id
     );
 
-    const product = db
-      .prepare(
-        "SELECT stock FROM products WHERE id = ?"
-      )
-      .get(req.params.productId);
+    const quantity = Number(
+      req.body.quantity
+    );
 
-    if (
-      !Number.isInteger(quantity) ||
-      quantity < 1
-    ) {
+    if (!Number.isInteger(quantity) || quantity < 1) {
       return res.status(400).json({
         error: "Quantity must be at least 1."
       });
     }
 
-    if (
-      !product ||
-      quantity > product.stock
-    ) {
-      return res.status(400).json({
-        error:
-          "Requested quantity exceeds available stock."
+    const product = await get(
+      "SELECT stock FROM products WHERE id = ?",
+      [productId]
+    );
+
+    if (!product) {
+      return res.status(404).json({
+        error: "Product not found."
       });
     }
 
-    db.prepare(`
-      UPDATE cart_items
-      SET quantity = ?
-      WHERE user_id = ?
-      AND product_id = ?
-    `).run(
-      quantity,
-      req.session.user.id,
-      req.params.productId
+    if (quantity > product.stock) {
+      return res.status(400).json({
+        error: "Requested quantity is not available."
+      });
+    }
+
+    const result = await run(
+      `
+        UPDATE cart_items
+        SET quantity = ?
+        WHERE user_id = ? AND product_id = ?
+      `,
+      [
+        quantity,
+        req.user.id,
+        productId
+      ]
     );
 
-    return res.json({
-      message: "Cart updated."
+    if (!result.changes) {
+      return res.status(404).json({
+        error: "Cart item not found."
+      });
+    }
+
+    res.json({
+      success: true
     });
-  }
+  })
 );
 
 app.delete(
-  "/api/cart/:productId",
-  requireAuth,
-  (req, res) => {
-    db.prepare(`
-      DELETE FROM cart_items
-      WHERE user_id = ?
-      AND product_id = ?
-    `).run(
-      req.session.user.id,
-      req.params.productId
+  "/api/cart/:id",
+  requireLogin,
+  asyncRoute(async (req, res) => {
+    await run(
+      `
+        DELETE FROM cart_items
+        WHERE user_id = ? AND product_id = ?
+      `,
+      [
+        req.user.id,
+        req.params.id
+      ]
     );
 
-    return res.json({
-      message: "Item removed from cart."
+    res.json({
+      success: true
     });
-  }
+  })
 );
 
-/* -----------------------------
-   Wishlist
------------------------------ */
+/* ---------------- WISHLIST ---------------- */
 
 app.get(
   "/api/wishlist",
-  requireAuth,
-  (req, res) => {
-    const items = db
-      .prepare(`
-        SELECT p.*
+  requireLogin,
+  asyncRoute(async (req, res) => {
+    const items = await all(
+      `
+        SELECT
+          p.id,
+          p.name,
+          p.category,
+          p.brand,
+          p.description,
+          p.price,
+          p.stock,
+          p.image,
+          p.rating
         FROM wishlist w
         JOIN products p
           ON p.id = w.product_id
         WHERE w.user_id = ?
-        AND p.active = 1
-      `)
-      .all(req.session.user.id);
+        ORDER BY w.id DESC
+      `,
+      [req.user.id]
+    );
 
-    return res.json(items);
-  }
+    res.json(items);
+  })
 );
 
 app.post(
   "/api/wishlist",
-  requireAuth,
-  (req, res) => {
-    const product = db
-      .prepare(`
-        SELECT id
-        FROM products
-        WHERE id = ?
-        AND active = 1
-      `)
-      .get(req.body?.productId);
+  requireLogin,
+  asyncRoute(async (req, res) => {
+    const productId = Number(
+      req.body.productId
+    );
+
+    const product = await get(
+      "SELECT id FROM products WHERE id = ?",
+      [productId]
+    );
 
     if (!product) {
       return res.status(404).json({
@@ -932,219 +856,494 @@ app.post(
       });
     }
 
-    db.prepare(`
-      INSERT OR IGNORE INTO wishlist
-      (user_id, product_id)
-      VALUES (?, ?)
-    `).run(
-      req.session.user.id,
-      product.id
+    await run(
+      `
+        INSERT OR IGNORE INTO wishlist
+        (user_id, product_id)
+        VALUES (?, ?)
+      `,
+      [
+        req.user.id,
+        productId
+      ]
     );
 
-    return res.json({
-      message: "Added to wishlist."
+    res.status(201).json({
+      success: true
     });
-  }
+  })
 );
 
 app.delete(
-  "/api/wishlist/:productId",
-  requireAuth,
-  (req, res) => {
-    db.prepare(`
-      DELETE FROM wishlist
-      WHERE user_id = ?
-      AND product_id = ?
-    `).run(
-      req.session.user.id,
-      req.params.productId
+  "/api/wishlist/:id",
+  requireLogin,
+  asyncRoute(async (req, res) => {
+    await run(
+      `
+        DELETE FROM wishlist
+        WHERE user_id = ? AND product_id = ?
+      `,
+      [
+        req.user.id,
+        req.params.id
+      ]
     );
 
-    return res.json({
-      message: "Removed from wishlist."
+    res.json({
+      success: true
     });
-  }
+  })
 );
 
-/* -----------------------------
-   Orders
------------------------------ */
+/* ---------------- ORDERS ---------------- */
+
+app.get(
+  "/api/orders",
+  requireLogin,
+  asyncRoute(async (req, res) => {
+    const orders = await all(
+      `
+        SELECT
+          id,
+          address,
+          total,
+          status,
+          created_at
+        FROM orders
+        WHERE user_id = ?
+        ORDER BY id DESC
+      `,
+      [req.user.id]
+    );
+
+    for (const order of orders) {
+      order.items = await all(
+        `
+          SELECT
+            product_id,
+            product_name,
+            price,
+            quantity
+          FROM order_items
+          WHERE order_id = ?
+        `,
+        [order.id]
+      );
+    }
+
+    res.json(orders);
+  })
+);
 
 app.post(
   "/api/orders",
-  requireAuth,
-  (req, res) => {
-    const address = req.body?.address;
+  requireLogin,
+  asyncRoute(async (req, res) => {
+    const address = String(
+      req.body.address || ""
+    ).trim();
 
-    if (!address || !address.trim()) {
+    if (address.length < 10) {
       return res.status(400).json({
-        error: "Shipping address is required."
+        error: "Please enter a complete shipping address."
       });
     }
 
-    const items = db
-      .prepare(`
+    const cart = await all(
+      `
         SELECT
+          c.product_id,
           c.quantity,
-          p.*
+          p.name,
+          p.price,
+          p.stock
         FROM cart_items c
         JOIN products p
           ON p.id = c.product_id
         WHERE c.user_id = ?
-        AND p.active = 1
-      `)
-      .all(req.session.user.id);
+      `,
+      [req.user.id]
+    );
 
-    if (!items.length) {
+    if (!cart.length) {
       return res.status(400).json({
         error: "Your cart is empty."
       });
     }
 
-    for (const item of items) {
+    for (const item of cart) {
       if (item.quantity > item.stock) {
         return res.status(400).json({
           error:
-            `Insufficient stock for ${item.name}.`
+            item.name +
+            " does not have enough stock."
         });
       }
     }
 
-    const total = items.reduce(
+    const total = cart.reduce(
       (sum, item) =>
         sum + item.price * item.quantity,
       0
     );
 
-    const createOrder = db.transaction(() => {
-      const orderResult = db
-        .prepare(`
+    await run("BEGIN TRANSACTION");
+
+    try {
+      const order = await run(
+        `
           INSERT INTO orders
-          (user_id, total, address)
-          VALUES (?, ?, ?)
-        `)
-        .run(
-          req.session.user.id,
-          total,
-          address.trim()
+          (user_id, address, total, status)
+          VALUES (?, ?, ?, 'Placed')
+        `,
+        [
+          req.user.id,
+          address,
+          total
+        ]
+      );
+
+      for (const item of cart) {
+        await run(
+          `
+            INSERT INTO order_items
+            (
+              order_id,
+              product_id,
+              product_name,
+              price,
+              quantity
+            )
+            VALUES (?, ?, ?, ?, ?)
+          `,
+          [
+            order.id,
+            item.product_id,
+            item.name,
+            item.price,
+            item.quantity
+          ]
         );
 
-      const orderId =
-        orderResult.lastInsertRowid;
-
-      const addOrderItem = db.prepare(`
-        INSERT INTO order_items
-        (order_id, product_id, product_name, price, quantity)
-        VALUES (?, ?, ?, ?, ?)
-      `);
-
-      const decreaseStock = db.prepare(`
-        UPDATE products
-        SET stock = stock - ?
-        WHERE id = ?
-      `);
-
-      items.forEach(item => {
-        addOrderItem.run(
-          orderId,
-          item.id,
-          item.name,
-          item.price,
-          item.quantity
+        await run(
+          `
+            UPDATE products
+            SET stock = stock - ?
+            WHERE id = ?
+          `,
+          [
+            item.quantity,
+            item.product_id
+          ]
         );
+      }
 
-        decreaseStock.run(
-          item.quantity,
-          item.id
-        );
+      await run(
+        `
+          DELETE FROM cart_items
+          WHERE user_id = ?
+        `,
+        [req.user.id]
+      );
+
+      await run("COMMIT");
+
+      res.status(201).json({
+        success: true,
+        orderId: order.id,
+        total
       });
+    } catch (error) {
+      await run("ROLLBACK");
+      throw error;
+    }
+  })
+);
 
-      db.prepare(`
-        DELETE FROM cart_items
-        WHERE user_id = ?
-      `).run(req.session.user.id);
+/* ---------------- ADMIN PRODUCTS ---------------- */
 
-      return orderId;
+app.post(
+  "/api/admin/products",
+  requireAdmin,
+  asyncRoute(async (req, res) => {
+    const {
+      name,
+      category,
+      brand = "",
+      description = "",
+      price,
+      stock,
+      image = "📦"
+    } = req.body;
+
+    if (
+      !name ||
+      !category ||
+      price === undefined ||
+      stock === undefined
+    ) {
+      return res.status(400).json({
+        error: "Name, category, price and stock are required."
+      });
+    }
+
+    const result = await run(
+      `
+        INSERT INTO products
+        (
+          name,
+          category,
+          brand,
+          description,
+          price,
+          stock,
+          image
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        name,
+        category,
+        brand,
+        description,
+        Number(price),
+        Number(stock),
+        image
+      ]
+    );
+
+    res.status(201).json({
+      success: true,
+      productId: result.id
     });
+  })
+);
 
-    const orderId = createOrder();
+app.put(
+  "/api/admin/products/:id",
+  requireAdmin,
+  asyncRoute(async (req, res) => {
+    const {
+      name,
+      category,
+      brand = "",
+      description = "",
+      price,
+      stock,
+      image = "📦"
+    } = req.body;
 
-    return res.status(201).json({
-      message: "Order placed successfully.",
-      orderId,
-      total
+    const result = await run(
+      `
+        UPDATE products
+        SET
+          name = ?,
+          category = ?,
+          brand = ?,
+          description = ?,
+          price = ?,
+          stock = ?,
+          image = ?
+        WHERE id = ?
+      `,
+      [
+        name,
+        category,
+        brand,
+        description,
+        Number(price),
+        Number(stock),
+        image,
+        req.params.id
+      ]
+    );
+
+    if (!result.changes) {
+      return res.status(404).json({
+        error: "Product not found."
+      });
+    }
+
+    res.json({
+      success: true
     });
-  }
+  })
+);
+
+app.delete(
+  "/api/admin/products/:id",
+  requireAdmin,
+  asyncRoute(async (req, res) => {
+    const result = await run(
+      `
+        DELETE FROM products
+        WHERE id = ?
+      `,
+      [req.params.id]
+    );
+
+    if (!result.changes) {
+      return res.status(404).json({
+        error: "Product not found."
+      });
+    }
+
+    res.json({
+      success: true
+    });
+  })
+);
+
+/* ---------------- ADMIN DASHBOARD ---------------- */
+
+app.get(
+  "/api/admin/dashboard",
+  requireAdmin,
+  asyncRoute(async (req, res) => {
+    const users = await get(
+      `
+        SELECT COUNT(*) AS count
+        FROM users
+        WHERE role = 'customer'
+      `
+    );
+
+    const products = await get(
+      "SELECT COUNT(*) AS count FROM products"
+    );
+
+    const orders = await get(
+      "SELECT COUNT(*) AS count FROM orders"
+    );
+
+    const revenue = await get(
+      "SELECT COALESCE(SUM(total), 0) AS total FROM orders"
+    );
+
+    const lowStock = await all(
+      `
+        SELECT *
+        FROM products
+        WHERE stock <= 5
+        ORDER BY stock ASC
+      `
+    );
+
+    res.json({
+      totalUsers: users.count,
+      totalProducts: products.count,
+      totalOrders: orders.count,
+      totalRevenue: revenue.total,
+      lowStock
+    });
+  })
 );
 
 app.get(
-  "/api/orders",
-  requireAuth,
-  (req, res) => {
-    const orders = db
-      .prepare(`
+  "/api/admin/low-stock",
+  requireAdmin,
+  asyncRoute(async (req, res) => {
+    const limit = Number(
+      req.query.limit || 5
+    );
+
+    const products = await all(
+      `
         SELECT *
-        FROM orders
-        WHERE user_id = ?
-        ORDER BY id DESC
-      `)
-      .all(req.session.user.id);
+        FROM products
+        WHERE stock <= ?
+        ORDER BY stock ASC
+      `,
+      [limit]
+    );
 
-    const result = orders.map(order => ({
-      ...order,
-      items: db
-        .prepare(`
-          SELECT *
-          FROM order_items
-          WHERE order_id = ?
-        `)
-        .all(order.id)
-    }));
-
-    return res.json(result);
-  }
+    res.json(products);
+  })
 );
 
-/* -----------------------------
-   Admin orders
------------------------------ */
+app.get(
+  "/api/admin/customers",
+  requireAdmin,
+  asyncRoute(async (req, res) => {
+    const customers = await all(
+      `
+        SELECT
+          u.id,
+          u.name,
+          u.email,
+          u.role,
+          u.created_at,
+          COUNT(o.id) AS orders_count,
+          COALESCE(SUM(o.total), 0) AS total_spent
+        FROM users u
+        LEFT JOIN orders o
+          ON o.user_id = u.id
+        WHERE u.role = 'customer'
+        GROUP BY u.id
+        ORDER BY u.id DESC
+      `
+    );
+
+    res.json(customers);
+  })
+);
 
 app.get(
   "/api/admin/orders",
-  requireAuth,
   requireAdmin,
-  (req, res) => {
-    const orders = db
-      .prepare(`
+  asyncRoute(async (req, res) => {
+    const orders = await all(
+      `
         SELECT
-          o.*,
+          o.id,
+          o.user_id,
+          o.address,
+          o.total,
+          o.status,
+          o.created_at,
           u.name AS customer_name,
-          u.email
+          u.email AS customer_email
         FROM orders o
         JOIN users u
           ON u.id = o.user_id
         ORDER BY o.id DESC
-      `)
-      .all();
+      `
+    );
 
-    return res.json(orders);
-  }
+    for (const order of orders) {
+      order.items = await all(
+        `
+          SELECT
+            product_name,
+            price,
+            quantity
+          FROM order_items
+          WHERE order_id = ?
+        `,
+        [order.id]
+      );
+    }
+
+    res.json(orders);
+  })
 );
 
-app.patch(
-  "/api/admin/orders/:id",
-  requireAuth,
+app.put(
+  "/api/admin/orders/:id/status",
   requireAdmin,
-  (req, res) => {
+  asyncRoute(async (req, res) => {
     const allowedStatuses = [
-      "Pending",
-      "Confirmed",
+      "Placed",
+      "Packed",
       "Shipped",
       "Delivered",
-      "Cancelled"
+      "Cancelled",
+      "Returned"
     ];
 
-    const status = req.body?.status;
+    const status = String(
+      req.body.status || ""
+    );
 
     if (!allowedStatuses.includes(status)) {
       return res.status(400).json({
@@ -1152,16 +1351,17 @@ app.patch(
       });
     }
 
-    const result = db
-      .prepare(`
+    const result = await run(
+      `
         UPDATE orders
         SET status = ?
         WHERE id = ?
-      `)
-      .run(
+      `,
+      [
         status,
         req.params.id
-      );
+      ]
+    );
 
     if (!result.changes) {
       return res.status(404).json({
@@ -1169,71 +1369,414 @@ app.patch(
       });
     }
 
-    return res.json({
-      message: "Order status updated."
+    res.json({
+      success: true
     });
-  }
+  })
 );
 
-/* -----------------------------
-   Test reset
------------------------------ */
+/* ---------------- CATEGORIES AND BRANDS ---------------- */
+
+app.get(
+  "/api/admin/categories",
+  requireAdmin,
+  asyncRoute(async (req, res) => {
+    const categories = await all(
+      `
+        SELECT
+          category AS name,
+          COUNT(*) AS product_count
+        FROM products
+        GROUP BY category
+        ORDER BY category
+      `
+    );
+
+    res.json(categories);
+  })
+);
+
+app.get(
+  "/api/admin/brands",
+  requireAdmin,
+  asyncRoute(async (req, res) => {
+    const brands = await all(
+      `
+        SELECT
+          brand AS name,
+          COUNT(*) AS product_count
+        FROM products
+        WHERE brand IS NOT NULL
+          AND brand != ''
+        GROUP BY brand
+        ORDER BY brand
+      `
+    );
+
+    res.json(brands);
+  })
+);
+
+/* ---------------- COUPONS ---------------- */
+
+app.get(
+  "/api/admin/coupons",
+  requireAdmin,
+  asyncRoute(async (req, res) => {
+    const coupons = await all(
+      `
+        SELECT *
+        FROM coupons
+        ORDER BY id DESC
+      `
+    );
+
+    res.json(coupons);
+  })
+);
 
 app.post(
-  "/api/test/reset",
-  requireAuth,
+  "/api/admin/coupons",
   requireAdmin,
-  (req, res) => {
-    db.prepare(
-      "DELETE FROM order_items"
-    ).run();
+  asyncRoute(async (req, res) => {
+    const code = String(
+      req.body.code || ""
+    )
+      .trim()
+      .toUpperCase();
 
-    db.prepare(
-      "DELETE FROM orders"
-    ).run();
+    const description = String(
+      req.body.description || ""
+    );
 
-    db.prepare(
-      "DELETE FROM cart_items"
-    ).run();
+    const discountType =
+      req.body.discountType === "flat"
+        ? "flat"
+        : "percentage";
 
-    db.prepare(
-      "DELETE FROM wishlist"
-    ).run();
+    const discountValue = Number(
+      req.body.discountValue || 0
+    );
 
-    db.prepare(`
-      UPDATE products
-      SET stock = 18
-      WHERE name = 'Studio Wireless Headphones'
-    `).run();
+    const expiresAt = String(
+      req.body.expiresAt || ""
+    );
 
-    return res.json({
-      message: "Test data reset completed."
+    if (!code || discountValue <= 0) {
+      return res.status(400).json({
+        error: "Coupon code and discount are required."
+      });
+    }
+
+    const result = await run(
+      `
+        INSERT INTO coupons
+        (
+          code,
+          description,
+          discount_type,
+          discount_value,
+          active,
+          expires_at
+        )
+        VALUES (?, ?, ?, ?, 1, ?)
+      `,
+      [
+        code,
+        description,
+        discountType,
+        discountValue,
+        expiresAt
+      ]
+    );
+
+    res.status(201).json({
+      success: true,
+      couponId: result.id
     });
-  }
+  })
 );
 
-/* -----------------------------
-   Frontend fallback
------------------------------ */
+app.put(
+  "/api/admin/coupons/:id",
+  requireAdmin,
+  asyncRoute(async (req, res) => {
+    const active = req.body.active ? 1 : 0;
 
-app.use((req, res) => {
-  if (req.path.startsWith("/api/")) {
-    return res.status(404).json({
-      error: "API route not found."
+    const result = await run(
+      `
+        UPDATE coupons
+        SET active = ?
+        WHERE id = ?
+      `,
+      [
+        active,
+        req.params.id
+      ]
+    );
+
+    if (!result.changes) {
+      return res.status(404).json({
+        error: "Coupon not found."
+      });
+    }
+
+    res.json({
+      success: true
+    });
+  })
+);
+
+app.delete(
+  "/api/admin/coupons/:id",
+  requireAdmin,
+  asyncRoute(async (req, res) => {
+    await run(
+      `
+        DELETE FROM coupons
+        WHERE id = ?
+      `,
+      [req.params.id]
+    );
+
+    res.json({
+      success: true
+    });
+  })
+);
+
+/* ---------------- REVIEWS ---------------- */
+
+app.get(
+  "/api/admin/reviews",
+  requireAdmin,
+  asyncRoute(async (req, res) => {
+    const reviews = await all(
+      `
+        SELECT
+          r.id,
+          r.rating,
+          r.comment,
+          r.status,
+          r.created_at,
+          p.name AS product_name,
+          u.name AS customer_name,
+          u.email AS customer_email
+        FROM reviews r
+        JOIN products p
+          ON p.id = r.product_id
+        JOIN users u
+          ON u.id = r.user_id
+        ORDER BY r.id DESC
+      `
+    );
+
+    res.json(reviews);
+  })
+);
+
+app.put(
+  "/api/admin/reviews/:id",
+  requireAdmin,
+  asyncRoute(async (req, res) => {
+    const allowedStatuses = [
+      "pending",
+      "approved",
+      "rejected"
+    ];
+
+    const status = String(
+      req.body.status || ""
+    );
+
+    if (!allowedStatuses.includes(status)) {
+      return res.status(400).json({
+        error: "Invalid review status."
+      });
+    }
+
+    const result = await run(
+      `
+        UPDATE reviews
+        SET status = ?
+        WHERE id = ?
+      `,
+      [
+        status,
+        req.params.id
+      ]
+    );
+
+    if (!result.changes) {
+      return res.status(404).json({
+        error: "Review not found."
+      });
+    }
+
+    res.json({
+      success: true
+    });
+  })
+);
+
+/* ---------------- CUSTOMER REVIEWS ---------------- */
+
+app.get(
+  "/api/products/:id/reviews",
+  asyncRoute(async (req, res) => {
+    const reviews = await all(
+      `
+        SELECT
+          r.id,
+          r.rating,
+          r.comment,
+          r.created_at,
+          u.name AS customer_name
+        FROM reviews r
+        JOIN users u
+          ON u.id = r.user_id
+        WHERE r.product_id = ?
+          AND r.status = 'approved'
+        ORDER BY r.id DESC
+      `,
+      [req.params.id]
+    );
+
+    res.json(reviews);
+  })
+);
+
+app.post(
+  "/api/products/:id/reviews",
+  requireLogin,
+  asyncRoute(async (req, res) => {
+    const rating = Number(
+      req.body.rating
+    );
+
+    const comment = String(
+      req.body.comment || ""
+    ).trim();
+
+    if (
+      !Number.isInteger(rating) ||
+      rating < 1 ||
+      rating > 5
+    ) {
+      return res.status(400).json({
+        error: "Rating must be between 1 and 5."
+      });
+    }
+
+    const product = await get(
+      "SELECT id FROM products WHERE id = ?",
+      [req.params.id]
+    );
+
+    if (!product) {
+      return res.status(404).json({
+        error: "Product not found."
+      });
+    }
+
+    await run(
+      `
+        INSERT INTO reviews
+        (
+          product_id,
+          user_id,
+          rating,
+          comment,
+          status
+        )
+        VALUES (?, ?, ?, ?, 'pending')
+      `,
+      [
+        req.params.id,
+        req.user.id,
+        rating,
+        comment
+      ]
+    );
+
+    res.status(201).json({
+      success: true,
+      message: "Review submitted for moderation."
+    });
+  })
+);
+
+/* ---------------- FALLBACK ---------------- */
+
+app.get("*", (req, res) => {
+  const indexPath = path.join(
+    staticFolder,
+    "index.html"
+  );
+
+  if (fs.existsSync(indexPath)) {
+    return res.sendFile(indexPath);
+  }
+
+  res.status(404).send("ShopX frontend not found.");
+});
+
+/* ---------------- ERROR HANDLER ---------------- */
+
+app.use((error, req, res, next) => {
+  console.error(error);
+
+  if (
+    error.code === "SQLITE_CONSTRAINT" ||
+    error.code === "SQLITE_CONSTRAINT_UNIQUE"
+  ) {
+    return res.status(409).json({
+      error: "This record already exists."
     });
   }
 
-  return res.sendFile(
-    path.join(__dirname, "index.html")
-  );
+  res.status(500).json({
+    error: "Server error. Please try again."
+  });
 });
 
-/* -----------------------------
-   Start server
------------------------------ */
+/* ---------------- START SERVER ---------------- */
 
-app.listen(PORT, () => {
-  console.log(
-    `ShopX running on port ${PORT}`
-  );
-});
+initializeDatabase()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(
+        `ShopX server running on port ${PORT}`
+      );
+
+      console.log(
+        "Admin: admin@shopx.test / Admin123!"
+      );
+
+      console.log(
+        "Customer: customer@shopx.test / Customer123!"
+      );
+    });
+  })
+  .catch(error => {
+    console.error(
+      "Database initialization failed:",
+      error
+    );
+
+    process.exit(1);
+  });
+
+package.json mein ye dependencies honi chahiye:
+
+{
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cookie-parser": "^1.4.7",
+    "express": "^4.21.2",
+    "sqlite3": "^5.1.7"
+  }
+}
