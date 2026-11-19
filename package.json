@@ -18,7 +18,6 @@
     "express-session": "^1.18.1"
   }
 }
-//package.json mein ye dependencies honi chahiye:
 
 {
   "scripts": {
